@@ -6,10 +6,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <tensorpipe/transport/shm/connection.h>
+#include <tensorpipe/transport/ib/connection.h>
 
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
+#include <cassert>
+#include <cstring>
 #include <deque>
 #include <vector>
 
@@ -18,10 +22,11 @@
 #include <tensorpipe/common/callback.h>
 #include <tensorpipe/common/defs.h>
 #include <tensorpipe/common/error_macros.h>
+#include <tensorpipe/common/mem.h>
 #include <tensorpipe/transport/error.h>
-#include <tensorpipe/transport/shm/loop.h>
-#include <tensorpipe/transport/shm/reactor.h>
-#include <tensorpipe/transport/shm/socket.h>
+#include <tensorpipe/transport/ib/loop.h>
+#include <tensorpipe/transport/ib/reactor.h>
+#include <tensorpipe/transport/ib/socket.h>
 #include <tensorpipe/util/ringbuffer/consumer.h>
 #include <tensorpipe/util/ringbuffer/producer.h>
 #include <tensorpipe/util/ringbuffer/protobuf_streams.h>
@@ -29,18 +34,32 @@
 
 namespace tensorpipe {
 namespace transport {
-namespace shm {
+namespace ib {
 
 namespace {
 
-// Reads happen only if the user supplied a callback (and optionally
-// a destination buffer). The callback is run from the event loop
-// thread upon receiving a notification from our peer.
-//
-// The memory pointer argument to the callback is valid only for the
-// duration of the callback. If the memory contents must be
-// preserved for longer, it must be copied elsewhere.
-//
+IbvQueuePair createIbvQueuePair(
+    IbvProtectionDomain& pd,
+    IbvCompletionQueue& cq,
+    IbvSharedReceiveQueue& srq) {
+  struct ibv_qp_init_attr initAttr;
+  std::memset(&initAttr, 0, sizeof(initAttr));
+  initAttr.qp_type = IBV_QPT_RC;
+  initAttr.send_cq = cq.ptr();
+  initAttr.recv_cq = cq.ptr();
+  initAttr.cap.max_send_wr = 1000;
+  initAttr.cap.max_send_sge = 2;
+  initAttr.srq = srq.ptr();
+  initAttr.sq_sig_all = 1;
+  return IbvQueuePair(pd, initAttr);
+}
+
+struct Exchange {
+  IbvSetupInformation setupInfo;
+  uint64_t memoryRegionPtr;
+  uint32_t memoryRegionKey;
+};
+
 class ReadOperation {
   enum Mode {
     READ_LENGTH,
@@ -49,9 +68,7 @@ class ReadOperation {
 
  public:
   using read_callback_fn = Connection::read_callback_fn;
-  using read_fn = std::function<ssize_t(util::ringbuffer::Consumer&)>;
   explicit ReadOperation(void* ptr, size_t len, read_callback_fn fn);
-  explicit ReadOperation(read_fn reader, read_callback_fn fn);
   explicit ReadOperation(read_callback_fn fn);
 
   // Processes a pending read.
@@ -66,7 +83,6 @@ class ReadOperation {
  private:
   Mode mode_{READ_LENGTH};
   void* ptr_{nullptr};
-  read_fn reader_;
   std::unique_ptr<uint8_t[]> buf_;
   size_t len_{0};
   size_t bytesRead_{0};
@@ -74,13 +90,6 @@ class ReadOperation {
   const bool ptrProvided_;
 };
 
-// Writes happen only if the user supplied a memory pointer, the
-// number of bytes to write, and a callback to execute upon
-// completion of the write.
-//
-// The memory pointed to by the pointer may only be reused or freed
-// after the callback has been called.
-//
 class WriteOperation {
   enum Mode {
     WRITE_LENGTH,
@@ -89,9 +98,7 @@ class WriteOperation {
 
  public:
   using write_callback_fn = Connection::write_callback_fn;
-  using write_fn = std::function<ssize_t(util::ringbuffer::Producer&)>;
   WriteOperation(const void* ptr, size_t len, write_callback_fn fn);
-  WriteOperation(write_fn writer, write_callback_fn fn);
 
   bool handleWrite(util::ringbuffer::Producer& producer);
 
@@ -104,7 +111,6 @@ class WriteOperation {
  private:
   Mode mode_{WRITE_LENGTH};
   const void* ptr_{nullptr};
-  write_fn writer_;
   size_t len_{0};
   size_t bytesWritten_{0};
   write_callback_fn fn_;
@@ -112,9 +118,6 @@ class WriteOperation {
 
 ReadOperation::ReadOperation(void* ptr, size_t len, read_callback_fn fn)
     : ptr_(ptr), len_(len), fn_(std::move(fn)), ptrProvided_(true) {}
-
-ReadOperation::ReadOperation(read_fn reader, read_callback_fn fn)
-    : reader_(std::move(reader)), fn_(std::move(fn)), ptrProvided_(false) {}
 
 ReadOperation::ReadOperation(read_callback_fn fn)
     : fn_(std::move(fn)), ptrProvided_(false) {}
@@ -132,60 +135,47 @@ bool ReadOperation::handleRead(util::ringbuffer::Consumer& inbox) {
   }
 
   bool lengthRead = false;
-  if (reader_) {
-    auto ret = reader_(inbox);
-    if (ret == -ENODATA) {
-      ret = inbox.cancelTx();
+  if (mode_ == READ_LENGTH) {
+    uint32_t length;
+    {
+      ssize_t ret;
+      ret = inbox.copyInTx(sizeof(length), &length);
+      if (ret == -ENODATA) {
+        ret = inbox.cancelTx();
+        TP_THROW_SYSTEM_IF(ret < 0, -ret);
+        return false;
+      }
       TP_THROW_SYSTEM_IF(ret < 0, -ret);
-      return false;
+    }
+
+    if (ptrProvided_) {
+      TP_DCHECK_EQ(length, len_);
+    } else {
+      len_ = length;
+      buf_ = std::make_unique<uint8_t[]>(len_);
+      ptr_ = buf_.get();
+    }
+    mode_ = READ_PAYLOAD;
+    lengthRead = true;
+  }
+
+  // If reading empty buffer, skip payload read.
+  if (len_ > 0) {
+    const auto ret = inbox.copyAtMostInTx(
+        len_ - bytesRead_, reinterpret_cast<uint8_t*>(ptr_) + bytesRead_);
+    if (ret == -ENODATA) {
+      if (lengthRead) {
+        const auto ret = inbox.commitTx();
+        TP_THROW_SYSTEM_IF(ret < 0, -ret);
+        return true;
+      } else {
+        const auto ret = inbox.cancelTx();
+        TP_THROW_SYSTEM_IF(ret < 0, -ret);
+        return false;
+      }
     }
     TP_THROW_SYSTEM_IF(ret < 0, -ret);
-
-    mode_ = READ_PAYLOAD;
-    bytesRead_ = len_ = ret;
-  } else {
-    if (mode_ == READ_LENGTH) {
-      uint32_t length;
-      {
-        ssize_t ret;
-        ret = inbox.copyInTx(sizeof(length), &length);
-        if (ret == -ENODATA) {
-          ret = inbox.cancelTx();
-          TP_THROW_SYSTEM_IF(ret < 0, -ret);
-          return false;
-        }
-        TP_THROW_SYSTEM_IF(ret < 0, -ret);
-      }
-
-      if (ptrProvided_) {
-        TP_DCHECK_EQ(length, len_);
-      } else {
-        len_ = length;
-        buf_ = std::make_unique<uint8_t[]>(len_);
-        ptr_ = buf_.get();
-      }
-      mode_ = READ_PAYLOAD;
-      lengthRead = true;
-    }
-
-    // If reading empty buffer, skip payload read.
-    if (len_ > 0) {
-      const auto ret = inbox.copyAtMostInTx(
-          len_ - bytesRead_, reinterpret_cast<uint8_t*>(ptr_) + bytesRead_);
-      if (ret == -ENODATA) {
-        if (lengthRead) {
-          const auto ret = inbox.commitTx();
-          TP_THROW_SYSTEM_IF(ret < 0, -ret);
-          return true;
-        } else {
-          const auto ret = inbox.cancelTx();
-          TP_THROW_SYSTEM_IF(ret < 0, -ret);
-          return false;
-        }
-      }
-      TP_THROW_SYSTEM_IF(ret < 0, -ret);
-      bytesRead_ += ret;
-    }
+    bytesRead_ += ret;
   }
 
   {
@@ -210,9 +200,6 @@ WriteOperation::WriteOperation(
     write_callback_fn fn)
     : ptr_(ptr), len_(len), fn_(std::move(fn)) {}
 
-WriteOperation::WriteOperation(write_fn writer, write_callback_fn fn)
-    : writer_(std::move(writer)), fn_(std::move(fn)) {}
-
 bool WriteOperation::handleWrite(util::ringbuffer::Producer& outbox) {
   // Start write transaction.
   // Retry because this must succeed.
@@ -231,29 +218,21 @@ bool WriteOperation::handleWrite(util::ringbuffer::Producer& outbox) {
   }
 
   ssize_t ret;
-  if (writer_) {
-    ret = writer_(outbox);
+  if (mode_ == WRITE_LENGTH) {
+    ret = outbox.writeInTx<uint32_t>(len_);
     if (ret > 0) {
       mode_ = WRITE_PAYLOAD;
-      bytesWritten_ = len_ = ret;
     }
-  } else {
-    if (mode_ == WRITE_LENGTH) {
-      ret = outbox.writeInTx<uint32_t>(len_);
-      if (ret > 0) {
-        mode_ = WRITE_PAYLOAD;
-      }
-    }
+  }
 
-    // If writing empty buffer, skip payload write because ptr_
-    // could be nullptr.
-    if (mode_ == WRITE_PAYLOAD && len_ > 0) {
-      ret = outbox.writeAtMostInTx(
-          len_ - bytesWritten_,
-          static_cast<const uint8_t*>(ptr_) + bytesWritten_);
-      if (ret > 0) {
-        bytesWritten_ += ret;
-      }
+  // If writing empty buffer, skip payload write because ptr_
+  // could be nullptr.
+  if (mode_ == WRITE_PAYLOAD && len_ > 0) {
+    ret = outbox.writeAtMostInTx(
+        len_ - bytesWritten_,
+        static_cast<const uint8_t*>(ptr_) + bytesWritten_);
+    if (ret > 0) {
+      bytesWritten_ += ret;
     }
   }
 
@@ -288,8 +267,8 @@ class Connection::Impl : public std::enable_shared_from_this<Connection::Impl>,
 
   enum State {
     INITIALIZING = 1,
-    SEND_FDS,
-    RECV_FDS,
+    SEND_ADDR,
+    RECV_ADDR,
     ESTABLISHED,
   };
 
@@ -311,14 +290,10 @@ class Connection::Impl : public std::enable_shared_from_this<Connection::Impl>,
 
   // Queue a read operation.
   void read(read_callback_fn fn);
-  void read(google::protobuf::MessageLite& message, read_proto_callback_fn fn);
   void read(void* ptr, size_t length, read_callback_fn fn);
 
   // Perform a write operation.
   void write(const void* ptr, size_t length, write_callback_fn fn);
-  void write(
-      const google::protobuf::MessageLite& message,
-      write_callback_fn fn);
 
   // Tell the connection what its identifier is.
   void setId(std::string id);
@@ -372,23 +347,6 @@ class Connection::Impl : public std::enable_shared_from_this<Connection::Impl>,
   optional<Sockaddr> sockaddr_;
   ClosingReceiver closingReceiver_;
 
-  // Inbox.
-  util::shm::Segment inboxHeaderSegment_;
-  util::shm::Segment inboxDataSegment_;
-  util::ringbuffer::RingBuffer inboxRb_;
-  optional<Reactor::TToken> inboxReactorToken_;
-
-  // Outbox.
-  util::shm::Segment outboxHeaderSegment_;
-  util::shm::Segment outboxDataSegment_;
-  util::ringbuffer::RingBuffer outboxRb_;
-  optional<Reactor::TToken> outboxReactorToken_;
-
-  // Peer trigger/tokens.
-  optional<Reactor::Trigger> peerReactorTrigger_;
-  optional<Reactor::TToken> peerInboxReactorToken_;
-  optional<Reactor::TToken> peerOutboxReactorToken_;
-
   // Pending read operations.
   std::deque<ReadOperation> readOperations_;
 
@@ -438,6 +396,29 @@ class Connection::Impl : public std::enable_shared_from_this<Connection::Impl>,
 
   // Deal with an error.
   void handleError();
+
+  IbvQueuePair qp_;
+  IbvSetupInformation ibvSelfInfo_;
+
+  // FIXME The header stores head and tail using atomics, but we don't need
+  // that. Are we incurring in a perf penalty? Could we avoid it?
+  util::ringbuffer::RingBufferHeader inboxHeader_{kBufferSize};
+  util::ringbuffer::RingBufferHeader outboxHeader_{kBufferSize};
+  PageAlignedPtr inboxBuf_{kBufferSize};
+  PageAlignedPtr outboxBuf_{kBufferSize};
+  util::ringbuffer::RingBuffer inboxRb_{&inboxHeader_, inboxBuf_.ptr()};
+  util::ringbuffer::RingBuffer outboxRb_{&outboxHeader_, outboxBuf_.ptr()};
+  IbvMemoryRegion inboxMr_{context_->getIbvPd(),
+                           inboxBuf_.ptr(),
+                           kBufferSize,
+                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE};
+  IbvMemoryRegion outboxMr_{context_->getIbvPd(),
+                            outboxBuf_.ptr(),
+                            kBufferSize,
+                            0};
+
+  uint32_t peerInboxKey_{0};
+  uint64_t peerInboxPtr_{0};
 };
 
 Connection::Connection(
@@ -527,27 +508,30 @@ void Connection::Impl::initFromLoop() {
     return;
   }
 
-  // Create ringbuffer for inbox.
-  std::tie(inboxHeaderSegment_, inboxDataSegment_, inboxRb_) =
-      util::ringbuffer::shm::create(kBufferSize);
-
-  // Register method to be called when our peer writes to our inbox.
-  inboxReactorToken_ = context_->addReaction(runIfAlive(*this, [](Impl& impl) {
-    TP_VLOG(9) << "Connection " << impl.id_
-               << " is reacting to the peer writing to the inbox";
-    impl.processReadOperationsFromLoop();
-  }));
-
-  // Register method to be called when our peer reads from our outbox.
-  outboxReactorToken_ = context_->addReaction(runIfAlive(*this, [](Impl& impl) {
-    TP_VLOG(9) << "Connection " << impl.id_
-               << " is reacting to the peer reading from the outbox";
-    impl.processWriteOperationsFromLoop();
-  }));
+  qp_ = createIbvQueuePair(
+      context_->getIbvPd(), context_->getIbvCq(), context_->getIbvSrq());
+  transitionIbvQueuePairToInit(qp_, context_->getIbvAddress());
 
   // We're sending file descriptors first, so wait for writability.
-  state_ = SEND_FDS;
+  state_ = SEND_ADDR;
   context_->registerDescriptor(socket_->fd(), EPOLLOUT, shared_from_this());
+
+  context_->registerQp(
+      qp_->qp_num,
+      runIfAlive(
+          *this,
+          [](Impl& impl, uint32_t numRead) {
+            TP_VLOG(9) << "Connection " << impl.id_ << " was signalled that "
+                       << numRead << " bytes were read from its outbox";
+            impl.outboxHeader_.incTail(numRead);
+            impl.processWriteOperationsFromLoop();
+          }),
+      runIfAlive(*this, [](Impl& impl, uint32_t numWritten) {
+        TP_VLOG(9) << "Connection " << impl.id_ << " was signalled that "
+                   << numWritten << " bytes were written to its inbox";
+        impl.inboxHeader_.incHead(numWritten);
+        impl.processReadOperationsFromLoop();
+      }));
 }
 
 void Connection::read(read_callback_fn fn) {
@@ -586,78 +570,6 @@ void Connection::Impl::readFromLoop(read_callback_fn fn) {
   }
 
   readOperations_.emplace_back(std::move(fn));
-
-  // If the inbox already contains some data, we may be able to process this
-  // operation right away.
-  processReadOperationsFromLoop();
-}
-
-void Connection::read(
-    google::protobuf::MessageLite& message,
-    read_proto_callback_fn fn) {
-  impl_->read(message, std::move(fn));
-}
-
-void Connection::Impl::read(
-    google::protobuf::MessageLite& message,
-    read_proto_callback_fn fn) {
-  context_->deferToLoop(
-      [impl{shared_from_this()}, &message, fn{std::move(fn)}]() mutable {
-        impl->readFromLoop(message, std::move(fn));
-      });
-}
-
-void Connection::Impl::readFromLoop(
-    google::protobuf::MessageLite& message,
-    read_proto_callback_fn fn) {
-  TP_DCHECK(context_->inLoopThread());
-
-  uint64_t sequenceNumber = nextBufferBeingRead_++;
-  TP_VLOG(7) << "Connection " << id_ << " received a proto read request (#"
-             << sequenceNumber << ")";
-
-  fn = [this, sequenceNumber, fn{std::move(fn)}](const Error& error) {
-    TP_DCHECK_EQ(sequenceNumber, nextReadCallbackToCall_++);
-    TP_VLOG(7) << "Connection " << id_ << " is calling a proto read callback (#"
-               << sequenceNumber << ")";
-    fn(error);
-    TP_VLOG(7) << "Connection " << id_
-               << " done calling a proto read callback (#" << sequenceNumber
-               << ")";
-  };
-
-  if (error_) {
-    fn(error_);
-    return;
-  }
-
-  readOperations_.emplace_back(
-      [&message](util::ringbuffer::Consumer& inbox) -> ssize_t {
-        uint32_t len;
-        {
-          const auto ret = inbox.copyInTx(sizeof(len), &len);
-          if (ret == -ENODATA) {
-            return -ENODATA;
-          }
-          TP_THROW_SYSTEM_IF(ret < 0, -ret);
-        }
-
-        if (len + sizeof(uint32_t) > kBufferSize) {
-          return -EPERM;
-        }
-
-        util::ringbuffer::ZeroCopyInputStream is(&inbox, len);
-        if (!message.ParseFromZeroCopyStream(&is)) {
-          return -ENODATA;
-        }
-
-        TP_DCHECK_EQ(len, is.ByteCount());
-        return is.ByteCount();
-      },
-      [fn{std::move(fn)}](
-          const Error& error, const void* /* unused */, size_t /* unused */) {
-        fn(error);
-      });
 
   // If the inbox already contains some data, we may be able to process this
   // operation right away.
@@ -753,74 +665,6 @@ void Connection::Impl::writeFromLoop(
   processWriteOperationsFromLoop();
 }
 
-void Connection::write(
-    const google::protobuf::MessageLite& message,
-    write_callback_fn fn) {
-  impl_->write(message, std::move(fn));
-}
-
-void Connection::Impl::write(
-    const google::protobuf::MessageLite& message,
-    write_callback_fn fn) {
-  context_->deferToLoop(
-      [impl{shared_from_this()}, &message, fn{std::move(fn)}]() mutable {
-        impl->writeFromLoop(message, std::move(fn));
-      });
-}
-
-void Connection::Impl::writeFromLoop(
-    const google::protobuf::MessageLite& message,
-    write_callback_fn fn) {
-  TP_DCHECK(context_->inLoopThread());
-
-  uint64_t sequenceNumber = nextBufferBeingWritten_++;
-  TP_VLOG(7) << "Connection " << id_ << " received a proto write request (#"
-             << sequenceNumber << ")";
-
-  fn = [this, sequenceNumber, fn{std::move(fn)}](const Error& error) {
-    TP_DCHECK_EQ(sequenceNumber, nextWriteCallbackToCall_++);
-    TP_VLOG(7) << "Connection " << id_
-               << " is calling a proto write callback (#" << sequenceNumber
-               << ")";
-    fn(error);
-    TP_VLOG(7) << "Connection " << id_
-               << " done calling a proto write callback (#" << sequenceNumber
-               << ")";
-  };
-
-  if (error_) {
-    fn(error_);
-    return;
-  }
-
-  writeOperations_.emplace_back(
-      [&message](util::ringbuffer::Producer& outbox) -> ssize_t {
-        size_t len = message.ByteSize();
-        if (len + sizeof(uint32_t) > kBufferSize) {
-          return -EPERM;
-        }
-
-        const auto ret = outbox.writeInTx<uint32_t>(len);
-        if (ret < 0) {
-          return ret;
-        }
-
-        util::ringbuffer::ZeroCopyOutputStream os(&outbox, len);
-        if (!message.SerializeToZeroCopyStream(&os)) {
-          return -ENOSPC;
-        }
-
-        TP_DCHECK_EQ(len, os.ByteCount());
-
-        return os.ByteCount();
-      },
-      std::move(fn));
-
-  // If the outbox has some free space, we may be able to process this operation
-  // right away.
-  processWriteOperationsFromLoop();
-}
-
 void Connection::setId(std::string id) {
   impl_->setId(std::move(id));
 }
@@ -888,45 +732,25 @@ void Connection::Impl::handleEventsFromLoop(int events) {
 
 void Connection::Impl::handleEventInFromLoop() {
   TP_DCHECK(context_->inLoopThread());
-  if (state_ == RECV_FDS) {
-    Fd reactorHeaderFd;
-    Fd reactorDataFd;
-    Fd outboxHeaderFd;
-    Fd outboxDataFd;
-    Reactor::TToken peerInboxReactorToken;
-    Reactor::TToken peerOutboxReactorToken;
+  if (state_ == RECV_ADDR) {
+    struct Exchange ex;
 
-    // Receive the reactor token, reactor fds, and inbox fds.
-    auto err = socket_->recvPayloadAndFds(
-        peerInboxReactorToken,
-        peerOutboxReactorToken,
-        reactorHeaderFd,
-        reactorDataFd,
-        outboxHeaderFd,
-        outboxDataFd);
-    if (err) {
-      setError_(std::move(err));
+    auto err = socket_->read(&ex, sizeof(ex));
+    if (err != sizeof(ex)) {
+      setError_(TP_CREATE_ERROR(ShortReadError, sizeof(ex), err));
       return;
     }
 
-    // Load ringbuffer for outbox.
-    std::tie(outboxHeaderSegment_, outboxDataSegment_, outboxRb_) =
-        util::ringbuffer::shm::load(
-            outboxHeaderFd.release(), outboxDataFd.release());
+    transitionIbvQueuePairToReadyToReceive(
+        qp_, context_->getIbvAddress(), ex.setupInfo);
+    transitionIbvQueuePairToReadyToSend(qp_, ibvSelfInfo_);
 
-    // Initialize remote reactor trigger.
-    peerReactorTrigger_.emplace(
-        std::move(reactorHeaderFd), std::move(reactorDataFd));
-
-    peerInboxReactorToken_ = peerInboxReactorToken;
-    peerOutboxReactorToken_ = peerOutboxReactorToken;
+    peerInboxKey_ = ex.memoryRegionKey;
+    peerInboxPtr_ = ex.memoryRegionPtr;
 
     // The connection is usable now.
     state_ = ESTABLISHED;
     processWriteOperationsFromLoop();
-    // Trigger read operations in case a pair of local read() and remote
-    // write() happened before connection is established. Otherwise read()
-    // callback would lose if it's the only read() request.
     processReadOperationsFromLoop();
     return;
   }
@@ -944,26 +768,21 @@ void Connection::Impl::handleEventInFromLoop() {
 
 void Connection::Impl::handleEventOutFromLoop() {
   TP_DCHECK(context_->inLoopThread());
-  if (state_ == SEND_FDS) {
-    int reactorHeaderFd;
-    int reactorDataFd;
-    std::tie(reactorHeaderFd, reactorDataFd) = context_->reactorFds();
+  if (state_ == SEND_ADDR) {
+    Exchange ex;
+    ibvSelfInfo_ = getIbvSetupInformation(context_->getIbvAddress(), qp_);
+    ex.setupInfo = ibvSelfInfo_;
+    ex.memoryRegionPtr = reinterpret_cast<uint64_t>(inboxBuf_.ptr());
+    ex.memoryRegionKey = inboxMr_->rkey;
 
-    // Send our reactor token, reactor fds, and inbox fds.
-    auto err = socket_->sendPayloadAndFds(
-        inboxReactorToken_.value(),
-        outboxReactorToken_.value(),
-        reactorHeaderFd,
-        reactorDataFd,
-        inboxHeaderSegment_.getFd(),
-        inboxDataSegment_.getFd());
-    if (err) {
-      setError_(std::move(err));
+    auto err = socket_->write(reinterpret_cast<void*>(&ex), sizeof(ex));
+    if (err != sizeof(ex)) {
+      setError_(TP_CREATE_ERROR(ShortWriteError, sizeof(ex), err));
       return;
     }
 
     // Sent our fds. Wait for fds from peer.
-    state_ = RECV_FDS;
+    state_ = RECV_ADDR;
     context_->registerDescriptor(socket_->fd(), EPOLLIN, shared_from_this());
     return;
   }
@@ -974,21 +793,34 @@ void Connection::Impl::handleEventOutFromLoop() {
 void Connection::Impl::processReadOperationsFromLoop() {
   TP_DCHECK(context_->inLoopThread());
 
-  // Process all read read operations that we can immediately serve, only
-  // when connection is established.
   if (state_ != ESTABLISHED) {
     return;
   }
-  // Serve read operations
+
   util::ringbuffer::Consumer inboxConsumer(inboxRb_);
   while (!readOperations_.empty()) {
-    auto readOperation = std::move(readOperations_.front());
-    readOperations_.pop_front();
-    if (readOperation.handleRead(inboxConsumer)) {
-      peerReactorTrigger_->run(peerOutboxReactorToken_.value());
+    // FIXME Wouldn't it be nice if handleWrite returned the number of bytes
+    // it writes to the ringbuffer? It would save us from having to find that
+    // out through the difference between the head before and after.
+    uint64_t prevInboxTail = inboxHeader_.readTail();
+    ReadOperation& op = readOperations_.front();
+    if (op.handleRead(inboxConsumer)) {
+      if (inboxHeader_.readTail() > prevInboxTail) {
+        uint32_t len = inboxHeader_.readTail() - prevInboxTail;
+
+        struct ibv_send_wr wr;
+        memset(&wr, 0, sizeof(wr));
+        wr.opcode = IBV_WR_SEND_WITH_IMM;
+        wr.imm_data = len;
+
+        struct ibv_send_wr* badWr = nullptr;
+        TP_CHECK_IBV_INT(ibv_post_send(qp_.ptr(), &wr, &badWr));
+        TP_THROW_ASSERT_IF(badWr != nullptr);
+      }
     }
-    if (!readOperation.completed()) {
-      readOperations_.push_front(std::move(readOperation));
+    if (op.completed()) {
+      readOperations_.pop_front();
+    } else {
       break;
     }
   }
@@ -1003,13 +835,56 @@ void Connection::Impl::processWriteOperationsFromLoop() {
 
   util::ringbuffer::Producer outboxProducer(outboxRb_);
   while (!writeOperations_.empty()) {
-    auto writeOperation = std::move(writeOperations_.front());
-    writeOperations_.pop_front();
-    if (writeOperation.handleWrite(outboxProducer)) {
-      peerReactorTrigger_->run(peerInboxReactorToken_.value());
+    WriteOperation& op = writeOperations_.front();
+    // FIXME Wouldn't it be nice if handleWrite returned the number of bytes
+    // it writes to the ringbuffer? It would save us from having to find that
+    // out through the difference between the head before and after.
+    uint64_t prevOutboxHead = outboxHeader_.readHead();
+    if (op.handleWrite(outboxProducer)) {
+      if (outboxHeader_.readHead() > prevOutboxHead) {
+        uint64_t start = prevOutboxHead % kBufferSize;
+        uint64_t end = outboxHeader_.readHead() % kBufferSize;
+        std::array<std::tuple<uint64_t, uint32_t>, 2> chunks;
+        int numChunks;
+        if (start < end) {
+          numChunks = 1;
+          chunks[0] = std::make_tuple(start, end - start);
+        } else {
+          // FIXME When end == 0 (== kBufferSize) this adds a useless chunk.
+          numChunks = 2;
+          chunks[0] = std::make_tuple(start, kBufferSize - start);
+          chunks[1] = std::make_tuple(0, end);
+        }
+
+        for (int chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+          uint64_t offset;
+          uint32_t len;
+          std::tie(offset, len) = chunks[chunkIdx];
+
+          struct ibv_sge list;
+          list.addr = reinterpret_cast<uint64_t>(outboxBuf_.ptr() + offset);
+          list.length = len;
+          list.lkey = outboxMr_->lkey;
+
+          struct ibv_send_wr wr;
+          std::memset(&wr, 0, sizeof(wr));
+          wr.sg_list = &list;
+          wr.num_sge = 1;
+          wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+          wr.imm_data = len;
+          wr.wr.rdma.remote_addr =
+              static_cast<uint64_t>(peerInboxPtr_ + offset);
+          wr.wr.rdma.rkey = peerInboxKey_;
+
+          struct ibv_send_wr* badWr = nullptr;
+          TP_CHECK_IBV_INT(ibv_post_send(qp_.ptr(), &wr, &badWr));
+          TP_THROW_ASSERT_IF(badWr != nullptr);
+        }
+      }
     }
-    if (!writeOperation.completed()) {
-      writeOperations_.push_front(writeOperation);
+    if (op.completed()) {
+      writeOperations_.pop_front();
+    } else {
       break;
     }
   }
@@ -1038,14 +913,7 @@ void Connection::Impl::handleError() {
     writeOperation.handleError(error_);
   }
   writeOperations_.clear();
-  if (inboxReactorToken_.has_value()) {
-    context_->removeReaction(inboxReactorToken_.value());
-    inboxReactorToken_.reset();
-  }
-  if (outboxReactorToken_.has_value()) {
-    context_->removeReaction(outboxReactorToken_.value());
-    outboxReactorToken_.reset();
-  }
+  context_->unregisterQp(qp_->qp_num);
   if (socket_ != nullptr) {
     if (state_ > INITIALIZING) {
       context_->unregisterDescriptor(socket_->fd());
@@ -1060,6 +928,6 @@ void Connection::Impl::closeFromLoop() {
   setError_(TP_CREATE_ERROR(ConnectionClosedError));
 }
 
-} // namespace shm
+} // namespace ib
 } // namespace transport
 } // namespace tensorpipe

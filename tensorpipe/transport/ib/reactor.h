@@ -18,15 +18,15 @@
 #include <vector>
 
 #include <tensorpipe/common/callback.h>
+#include <tensorpipe/common/ibv.h>
 #include <tensorpipe/common/optional.h>
-#include <tensorpipe/transport/shm/fd.h>
+#include <tensorpipe/transport/ib/fd.h>
 #include <tensorpipe/util/ringbuffer/consumer.h>
 #include <tensorpipe/util/ringbuffer/producer.h>
-#include <tensorpipe/util/shm/segment.h>
 
 namespace tensorpipe {
 namespace transport {
-namespace shm {
+namespace ib {
 
 // Reactor loop.
 //
@@ -88,6 +88,9 @@ class Reactor final {
   // Removes function associated with token from reactor.
   void remove(TToken token);
 
+  // Trigger reactor with specified token.
+  void trigger(TToken token);
+
   // Returns the file descriptors for the underlying ring buffer.
   std::tuple<int, int> fds() const;
 
@@ -107,10 +110,46 @@ class Reactor final {
 
   ~Reactor();
 
+  IbvContext& getIbvContext() {
+    return ctx_;
+  }
+
+  IbvProtectionDomain& getIbvPd() {
+    return pd_;
+  }
+
+  IbvCompletionQueue& getIbvCq() {
+    return cq_;
+  }
+
+  IbvSharedReceiveQueue& getIbvSrq() {
+    return srq_;
+  }
+
+  IbvAddress& getIbvAddress() {
+    return addr_;
+  }
+
+  void registerQp(
+      uint32_t qpn,
+      std::function<void(uint32_t)> onConsumed,
+      std::function<void(uint32_t)> onProduced);
+
+  void unregisterQp(uint32_t qpn);
+
+  uint8_t getIbPortNum() {
+    return 1;
+  }
+
  private:
-  util::shm::Segment headerSegment_;
-  util::shm::Segment dataSegment_;
-  util::ringbuffer::RingBuffer rb_;
+  // InfiniBand stuff
+  IbvContext ctx_;
+  IbvProtectionDomain pd_;
+  IbvCompletionQueue cq_;
+  IbvSharedReceiveQueue srq_;
+  IbvAddress addr_;
+
+  void postRecvRequestsOnSRQ_(int num);
 
   std::mutex mutex_;
   std::thread thread_;
@@ -138,33 +177,12 @@ class Reactor final {
   // Reactor thread entry point.
   void run();
 
-  // Tokens are placed in this set if they can be reused.
-  std::set<TToken> reusableTokens_;
-
-  // Map reactor tokens to functions.
-  //
-  // The tokens are reused so we don't worry about unbounded growth
-  // and comfortably use a std::vector here.
-  //
-  std::vector<TFunction> functions_;
-
-  // Count how many functions are registered.
-  std::atomic<uint64_t> functionCount_{0};
-
- public:
-  class Trigger {
-   public:
-    Trigger(Fd&& header, Fd&& data);
-
-    void run(TToken token);
-
-   private:
-    util::shm::Segment headerSegment_;
-    util::shm::Segment dataSegment_;
-    util::ringbuffer::RingBuffer rb_;
-  };
+  std::unordered_map<
+      uint32_t,
+      std::tuple<std::function<void(uint32_t)>, std::function<void(uint32_t)>>>
+      fns_;
 };
 
-} // namespace shm
+} // namespace ib
 } // namespace transport
 } // namespace tensorpipe

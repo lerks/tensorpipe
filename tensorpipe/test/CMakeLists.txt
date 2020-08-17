@@ -38,6 +38,12 @@ if(TP_ENABLE_SHM)
     )
 endif()
 
+if(TP_ENABLE_IB)
+  target_sources(tensorpipe_test PRIVATE
+    transport/ib/ib_test.cc
+    )
+endif()
+
 if(TP_ENABLE_CMA)
   target_sources(tensorpipe_test PRIVATE
     channel/cma/cma_test.cc

@@ -27,15 +27,15 @@ using namespace tensorpipe::transport::shm;
 // Same process produces and consumes share memory through different mappings.
 TEST(ShmRingBuffer, SameProducerConsumer) {
   // This must stay alive for the file descriptors to remain open.
-  std::shared_ptr<RingBuffer> producer_rb;
-  int header_fd = -1;
-  int data_fd = -1;
+  tensorpipe::util::shm::Segment header_fd;
+  tensorpipe::util::shm::Segment data_fd;
+  RingBuffer producer_rb;
   {
     // Producer part.
     // Buffer large enough to fit all data and persistent
     // (needs to be unlinked up manually).
     std::tie(header_fd, data_fd, producer_rb) = shm::create(256 * 1024);
-    Producer prod{producer_rb};
+    Producer prod(producer_rb);
 
     // Producer loop. It all fits in buffer.
     int i = 0;
@@ -49,8 +49,12 @@ TEST(ShmRingBuffer, SameProducerConsumer) {
   {
     // Consumer part.
     // Map file again (to a different address) and consume it.
-    auto rb = shm::load(header_fd, data_fd);
-    Consumer cons{rb};
+    tensorpipe::util::shm::Segment header_segment;
+    tensorpipe::util::shm::Segment data_segment;
+    RingBuffer rb;
+    std::tie(header_segment, data_segment, rb) =
+        shm::load(header_fd.getFd(), data_fd.getFd());
+    Consumer cons(rb);
 
     int i = 0;
     while (i < 2000) {
@@ -86,14 +90,15 @@ TEST(ShmRingBuffer, SingleProducer_SingleConsumer) {
     // child, the producer
     // Make a scope so shared_ptr's are released even on exit(0).
     {
-      int header_fd;
-      int data_fd;
-      std::shared_ptr<RingBuffer> rb;
+      tensorpipe::util::shm::Segment header_fd;
+      tensorpipe::util::shm::Segment data_fd;
+      RingBuffer rb;
       std::tie(header_fd, data_fd, rb) = shm::create(1024);
-      Producer prod{rb};
+      Producer prod(rb);
 
       {
-        auto err = sendFdsToSocket(sock_fds[0], header_fd, data_fd);
+        auto err =
+            sendFdsToSocket(sock_fds[0], header_fd.getFd(), data_fd.getFd());
         if (err) {
           TP_THROW_ASSERT() << err.what();
         }
@@ -134,8 +139,11 @@ TEST(ShmRingBuffer, SingleProducer_SingleConsumer) {
       TP_THROW_ASSERT() << err.what();
     }
   }
-  auto rb = shm::load(header_fd, data_fd);
-  Consumer cons{rb};
+  tensorpipe::util::shm::Segment header_segment;
+  tensorpipe::util::shm::Segment data_segment;
+  RingBuffer rb;
+  std::tie(header_segment, data_segment, rb) = shm::load(header_fd, data_fd);
+  Consumer cons(rb);
 
   int i = 0;
   while (i < 2000) {

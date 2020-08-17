@@ -22,12 +22,22 @@ using namespace tensorpipe::util::ringbuffer;
 
 namespace {
 
-std::shared_ptr<RingBuffer> makeRingBuffer(size_t size) {
-  auto header = std::make_shared<RingBufferHeader>(size);
+struct RingBufferHolder {
+  std::shared_ptr<RingBufferHeader> header;
+  std::shared_ptr<uint8_t> data;
+  std::shared_ptr<RingBuffer> rb;
+};
+
+RingBufferHolder makeRingBuffer(size_t size) {
+  RingBufferHolder holder;
+  holder.header = std::make_shared<RingBufferHeader>(size);
   // In C++20 use std::make_shared<uint8_t[]>(size)
-  auto data = std::shared_ptr<uint8_t>(
-      new uint8_t[header->kDataPoolByteSize], std::default_delete<uint8_t[]>());
-  return std::make_shared<RingBuffer>(std::move(header), std::move(data));
+  holder.data = std::shared_ptr<uint8_t>(
+      new uint8_t[holder.header->kDataPoolByteSize],
+      std::default_delete<uint8_t[]>());
+  holder.rb =
+      std::make_shared<RingBuffer>(holder.header.get(), holder.data.get());
+  return holder;
 }
 
 proto::Brochure getMessage() {
@@ -59,7 +69,7 @@ void test_serialize_parse(
   EXPECT_LE(len, rb->getHeader().kDataPoolByteSize)
       << "Message larger than ring buffer.";
   {
-    Producer p{rb};
+    Producer p{*rb};
 
     ssize_t ret = p.startTx();
     EXPECT_EQ(ret, 0);
@@ -75,7 +85,7 @@ void test_serialize_parse(
 
   proto::Brochure parsed_message;
   {
-    Consumer c{rb};
+    Consumer c{*rb};
 
     ssize_t ret = c.startTx();
     EXPECT_EQ(ret, 0);
@@ -97,7 +107,8 @@ void test_serialize_parse(
 
 TEST(RingBuffer, NonWrappingZeroCopyStream) {
   constexpr size_t kBufferSize = 2 * 1024 * 1024;
-  auto rb = makeRingBuffer(kBufferSize);
+  auto holder = makeRingBuffer(kBufferSize);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
 
   proto::Brochure message = getMessage();
 
@@ -106,16 +117,17 @@ TEST(RingBuffer, NonWrappingZeroCopyStream) {
 
 TEST(RingBuffer, WrappingZeroCopyStream) {
   constexpr size_t kBufferSize = 2 * 1024 * 1024;
-  auto rb = makeRingBuffer(kBufferSize);
+  auto holder = makeRingBuffer(kBufferSize);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
 
   // Write and consume enough bytes to force the next write to wrap around.
   {
-    Producer p{rb};
+    Producer p{*rb};
     std::array<char, kBufferSize - 1> garbage;
     EXPECT_EQ(p.write(garbage.data(), sizeof(garbage)), sizeof(garbage));
   }
   {
-    Consumer c{rb};
+    Consumer c{*rb};
     std::array<char, kBufferSize - 1> buf;
     EXPECT_EQ(c.copy(sizeof(buf), buf.data()), sizeof(buf));
   }

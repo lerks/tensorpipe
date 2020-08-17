@@ -1,0 +1,28 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+syntax = "proto3";
+
+package tensorpipe.channel.gdr.proto;
+
+message IbvSetupInfo {
+  uint32 local_identifier = 1;
+  uint32 queue_pair_number = 2;
+  uint32 maximum_transmission_unit = 3;
+  uint64 subnet_prefix = 4;
+  uint64 interface_identifier = 5;
+
+  uint32 staging_buffer_remote_key = 6;
+  uint64 staging_buffer_ptr = 7;
+}
+
+message Packet {
+  oneof type {
+    IbvSetupInfo ibv_setup_info = 1;
+  }
+}

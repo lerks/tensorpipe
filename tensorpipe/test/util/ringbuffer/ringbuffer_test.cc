@@ -26,12 +26,22 @@ struct TestData {
   }
 };
 
-std::shared_ptr<RingBuffer> makeRingBuffer(size_t size) {
-  auto header = std::make_shared<RingBufferHeader>(size);
+struct RingBufferHolder {
+  std::shared_ptr<RingBufferHeader> header;
+  std::shared_ptr<uint8_t> data;
+  std::shared_ptr<RingBuffer> rb;
+};
+
+RingBufferHolder makeRingBuffer(size_t size) {
+  RingBufferHolder holder;
+  holder.header = std::make_shared<RingBufferHeader>(size);
   // In C++20 use std::make_shared<uint8_t[]>(size)
-  auto data = std::shared_ptr<uint8_t>(
-      new uint8_t[header->kDataPoolByteSize], std::default_delete<uint8_t[]>());
-  return std::make_shared<RingBuffer>(std::move(header), std::move(data));
+  holder.data = std::shared_ptr<uint8_t>(
+      new uint8_t[holder.header->kDataPoolByteSize],
+      std::default_delete<uint8_t[]>());
+  holder.rb =
+      std::make_shared<RingBuffer>(holder.header.get(), holder.data.get());
+  return holder;
 }
 
 TEST(RingBuffer, WriteCopy) {
@@ -40,11 +50,12 @@ TEST(RingBuffer, WriteCopy) {
   // 16 bytes buffer. Fits two full TestData (each 6).
   size_t size = 1u << 4;
 
-  auto rb = makeRingBuffer(size);
+  auto holder = makeRingBuffer(size);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
   // Make a producer.
-  Producer p{rb};
+  Producer p{*rb};
   // Make a consumer.
-  Consumer c{rb};
+  Consumer c{*rb};
 
   EXPECT_EQ(rb->getHeader().usedSizeWeak(), 0);
 
@@ -103,11 +114,12 @@ TEST(RingBuffer, ReadMultipleElems) {
   // 256 bytes buffer.
   size_t size = 1u << 8u;
 
-  auto rb = makeRingBuffer(size);
+  auto holder = makeRingBuffer(size);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
   // Make a producer.
-  Producer p{rb};
+  Producer p{*rb};
   // Make a consumer.
-  Consumer c{rb};
+  Consumer c{*rb};
 
   EXPECT_EQ(rb->getHeader().usedSizeWeak(), 0);
 
@@ -183,11 +195,12 @@ TEST(RingBuffer, CopyWrapping) {
   // 8 bytes buffer.
   size_t size = 1u << 3;
 
-  auto rb = makeRingBuffer(size);
+  auto holder = makeRingBuffer(size);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
   // Make a producer.
-  Producer p{rb};
+  Producer p{*rb};
   // Make a consumer.
-  Consumer c{rb};
+  Consumer c{*rb};
 
   EXPECT_EQ(rb->getHeader().usedSizeWeak(), 0);
 
@@ -237,11 +250,12 @@ TEST(RingBuffer, ReadTxWrappingOneCons) {
   // 8 bytes buffer.
   size_t size = 1u << 3;
 
-  auto rb = makeRingBuffer(size);
+  auto holder = makeRingBuffer(size);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
   // Make a producer.
-  Producer p{rb};
+  Producer p{*rb};
   // Make a consumer.
-  Consumer c1{rb};
+  Consumer c1{*rb};
 
   EXPECT_EQ(rb->getHeader().usedSizeWeak(), 0);
 
@@ -382,12 +396,13 @@ TEST(RingBuffer, ReadTxWrapping) {
   // 8 bytes buffer.
   size_t size = 1u << 3;
 
-  auto rb = makeRingBuffer(size);
+  auto holder = makeRingBuffer(size);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
   // Make a producer.
-  Producer p{rb};
+  Producer p{*rb};
   // Make consumers.
-  Consumer c1{rb};
-  Consumer c2{rb};
+  Consumer c1{*rb};
+  Consumer c2{*rb};
 
   EXPECT_EQ(rb->getHeader().usedSizeWeak(), 0);
 
@@ -537,11 +552,12 @@ TEST(RingBuffer, readContiguousAtMostInTx) {
   // 256 bytes buffer.
   size_t size = 1u << 8u;
 
-  auto rb = makeRingBuffer(size);
+  auto holder = makeRingBuffer(size);
+  std::shared_ptr<RingBuffer> rb = holder.rb;
   // Make a producer.
-  Producer p{rb};
+  Producer p{*rb};
   // Make a consumer.
-  Consumer c{rb};
+  Consumer c{*rb};
 
   EXPECT_EQ(rb->getHeader().usedSizeWeak(), 0);
 

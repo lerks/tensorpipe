@@ -21,6 +21,8 @@
 #include <string>
 #include <system_error>
 
+#include <cuda_runtime.h>
+
 // Branch hint macros. C++20 will include them as part of language.
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -285,3 +287,10 @@ inline unsigned long TensorPipeVerbosityLevel() {
 #define TP_LOG_EXCEPTION(e)                         \
   TP_LOG_ERROR() << "Exception in " << __FUNCTION__ \
                  << " . Message: " << e.what()
+
+#define TP_CHECK_CUDA(op)                                                  \
+  {                                                                        \
+    cudaError_t cudaRv = op;                                               \
+    TP_THROW_ASSERT_IF(cudaRv != cudaSuccess)                              \
+        << cudaGetErrorName(cudaRv) << ": " << cudaGetErrorString(cudaRv); \
+  }

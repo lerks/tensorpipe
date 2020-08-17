@@ -29,12 +29,20 @@ namespace shm {
 /// <min_rb_byte_size> is the minimum size of the data section
 /// of a RingBuffer (or each CPU's RingBuffer).
 ///
-std::tuple<int, int, std::shared_ptr<RingBuffer>> create(
+std::tuple<
+    tensorpipe::util::shm::Segment,
+    tensorpipe::util::shm::Segment,
+    RingBuffer>
+create(
     size_t min_rb_byte_size,
     optional<tensorpipe::util::shm::PageType> data_page_type = nullopt,
     bool perm_write = true);
 
-std::shared_ptr<RingBuffer> load(
+std::tuple<
+    tensorpipe::util::shm::Segment,
+    tensorpipe::util::shm::Segment,
+    RingBuffer>
+load(
     int header_fd,
     int data_fd,
     optional<tensorpipe::util::shm::PageType> data_page_type = nullopt,

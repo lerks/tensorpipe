@@ -117,18 +117,43 @@ void Segment::mmap(bool perm_write, optional<PageType> page_type) {
   this->base_ptr_ = mmapShmFd(fd_, byte_size_, perm_write, page_type_);
 }
 
+void Segment::reset() {
+  if (base_ptr_ != nullptr) {
+    int ret = munmap(base_ptr_, byte_size_);
+    if (ret == -1) {
+      TP_LOG_ERROR() << "Error while munmapping shared memory segment. Error: "
+                     << toErrorCode(errno).message();
+    }
+  }
+  if (fd_ >= 0) {
+    int ret = ::close(fd_);
+    TP_THROW_SYSTEM_IF(ret != 0, errno);
+  }
+  page_type_ = PageType::Default;
+  fd_ = -1;
+  byte_size_ = 0;
+  base_ptr_ = nullptr;
+}
+
+Segment& Segment::operator=(Segment&& other) {
+  reset();
+  page_type_ = other.page_type_;
+  fd_ = other.fd_;
+  byte_size_ = other.byte_size_;
+  base_ptr_ = other.base_ptr_;
+  other.page_type_ = PageType::Default;
+  other.fd_ = -1;
+  other.byte_size_ = 0;
+  other.base_ptr_ = nullptr;
+  return *this;
+}
+
+Segment::Segment(Segment&& other) {
+  *this = std::move(other);
+}
+
 Segment::~Segment() {
-  int ret = munmap(base_ptr_, byte_size_);
-  if (ret == -1) {
-    TP_LOG_ERROR() << "Error while munmapping shared memory segment. Error: "
-                   << toErrorCode(errno).message();
-  }
-  if (0 > fd_) {
-    TP_LOG_ERROR() << "Attempt to destroy segment with negative file "
-                   << "descriptor";
-    return;
-  }
-  ::close(fd_);
+  reset();
 }
 
 } // namespace shm

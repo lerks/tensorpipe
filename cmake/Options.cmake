@@ -12,6 +12,7 @@ endif()
 
 # Transports
 option(TP_ENABLE_SHM "Enable shm transport" ${LINUX})
+option(TP_ENABLE_IB "Enable InfiniBand transport" ${LINUX})
 
 # Channels
 option(TP_ENABLE_CMA "Enable cma channel" ${LINUX})

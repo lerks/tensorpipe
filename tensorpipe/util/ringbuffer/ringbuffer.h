@@ -81,12 +81,16 @@ class RingBufferHeader {
   // Get size that is only guaranteed to be correct when producers and consumers
   // are synchronized.
   size_t usedSizeWeak() const {
-    return atomicHead_ - atomicTail_;
+    return readHead() - readTail();
   }
 
   size_t freeSizeWeak() const {
     return kDataPoolByteSize - usedSizeWeak();
   }
+
+  // FIXME Could we read/modify the head and tail with a less strict memory
+  // order than sequential consistency? Relaxed may be enough, given we have
+  // locking. Would this help performance?
 
   uint64_t readHead() const {
     return atomicHead_;
@@ -101,10 +105,6 @@ class RingBufferHeader {
   }
   void incTail(uint64_t inc) {
     atomicTail_ += inc;
-  }
-
-  void drop() {
-    atomicTail_.store(atomicHead_.load());
   }
 
   // acquired by producers.
@@ -133,13 +133,10 @@ class RingBufferHeader {
 ///
 class RingBuffer final {
  public:
-  RingBuffer(const RingBuffer&) = delete;
-  RingBuffer(RingBuffer&&) = delete;
+  RingBuffer() = default;
 
-  RingBuffer(
-      std::shared_ptr<RingBufferHeader> header,
-      std::shared_ptr<uint8_t> data)
-      : header_{std::move(header)}, data_{std::move(data)} {
+  RingBuffer(RingBufferHeader* header, uint8_t* data)
+      : header_(header), data_(data) {
     TP_THROW_IF_NULLPTR(header_) << "Header cannot be nullptr";
     TP_THROW_IF_NULLPTR(data_) << "Data cannot be nullptr";
   }
@@ -153,51 +150,16 @@ class RingBuffer final {
   }
 
   const uint8_t* getData() const {
-    return data_.get();
+    return data_;
   }
 
   uint8_t* getData() {
-    return data_.get();
+    return data_;
   }
 
  protected:
-  std::shared_ptr<RingBufferHeader> header_;
-
-  // Note: this is a std::shared_ptr<uint8_t[]> semantically.
-  // A shared_ptr with array type is supported in C++17 and higher.
-  std::shared_ptr<uint8_t> data_;
-};
-
-///
-/// Ringbuffer wrapper
-///
-class RingBufferWrapper {
- public:
-  RingBufferWrapper(const RingBufferWrapper&) = delete;
-
-  RingBufferWrapper(std::shared_ptr<RingBuffer> rb)
-      : rb_{rb}, header_{rb->getHeader()}, data_{rb->getData()} {
-    TP_THROW_IF_NULLPTR(rb);
-    TP_THROW_IF_NULLPTR(data_);
-  }
-
-  auto& getHeader() {
-    return header_;
-  }
-
-  const auto& getHeader() const {
-    return header_;
-  }
-
-  auto getRingBuffer() {
-    return rb_;
-  }
-
- protected:
-  std::shared_ptr<RingBuffer> rb_;
-  RingBufferHeader& header_;
-  uint8_t* const data_;
-  unsigned tx_size_ = 0;
+  RingBufferHeader* header_ = nullptr;
+  uint8_t* data_ = nullptr;
 };
 
 } // namespace ringbuffer

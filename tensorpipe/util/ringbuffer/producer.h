@@ -19,13 +19,19 @@ namespace ringbuffer {
 ///
 /// Provides method to write into ringbuffer.
 ///
-class Producer : public RingBufferWrapper {
+class Producer {
  public:
-  // Use base class constructor.
-  using RingBufferWrapper::RingBufferWrapper;
+  Producer() = delete;
+
+  Producer(RingBuffer& rb) : header_{rb.getHeader()}, data_{rb.getData()} {
+    TP_THROW_IF_NULLPTR(data_);
+  }
 
   Producer(const Producer&) = delete;
   Producer(Producer&&) = delete;
+
+  Producer& operator=(const Producer&) = delete;
+  Producer& operator=(Producer&&) = delete;
 
   //
   // Transaction based API.
@@ -121,12 +127,6 @@ class Producer : public RingBufferWrapper {
 
   [[nodiscard]] std::pair<ssize_t, void*> reserveContiguousInTx(
       const size_t size) {
-    if (unlikely(size == 0)) {
-      TP_LOG_WARNING() << "Reserve of size zero is not supported. "
-                       << "Is size set correctly?";
-      return {-EINVAL, nullptr};
-    }
-
     if (unlikely(size > this->header_.kDataPoolByteSize)) {
       TP_LOG_WARNING() << "Asked to reserve " << size << " bytes in a buffer"
                        << " of size " << this->header_.kDataPoolByteSize;
@@ -163,6 +163,9 @@ class Producer : public RingBufferWrapper {
   }
 
  protected:
+  RingBufferHeader& header_;
+  uint8_t* const data_;
+  unsigned tx_size_ = 0;
   bool inTx_{false};
 
   // Return 0 if succeded, otherwise return negative error code.
@@ -173,9 +176,7 @@ class Producer : public RingBufferWrapper {
     TP_THROW_IF_NULLPTR(d);
 
     if (unlikely(size == 0)) {
-      TP_LOG_WARNING() << "Copies of size zero are not supported. "
-                       << "Is size set correctly?";
-      return -EINVAL;
+      return 0;
     }
 
     if (unlikely(size > this->header_.kDataPoolByteSize)) {
