@@ -6,13 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <tensorpipe/transport/shm/socket.h>
+#include <tensorpipe/common/socket.h>
 
 #include <gtest/gtest.h>
 
-using namespace tensorpipe::transport;
+using namespace tensorpipe;
 
 TEST(Sockaddr, FromToString) {
-  auto addr = shm::Sockaddr::createAbstractUnixAddr("foo");
+  auto addr = Sockaddr::createAbstractUnixAddr("foo");
   ASSERT_EQ(addr.str(), std::string("foo"));
 }

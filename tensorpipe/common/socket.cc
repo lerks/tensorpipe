@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <tensorpipe/transport/shm/socket.h>
+#include <tensorpipe/common/socket.h>
 
 #include <fcntl.h>
 #include <sys/un.h>
@@ -17,8 +17,6 @@
 #include <tensorpipe/common/defs.h>
 
 namespace tensorpipe {
-namespace transport {
-namespace shm {
 
 Sockaddr Sockaddr::createAbstractUnixAddr(const std::string& name) {
   struct sockaddr_un sun;
@@ -132,6 +130,4 @@ Error Socket::connect(const Sockaddr& addr) {
   return Error::kSuccess;
 }
 
-} // namespace shm
-} // namespace transport
 } // namespace tensorpipe

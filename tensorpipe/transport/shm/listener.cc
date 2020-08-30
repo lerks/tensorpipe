@@ -16,10 +16,10 @@
 #include <tensorpipe/common/callback.h>
 #include <tensorpipe/common/defs.h>
 #include <tensorpipe/common/optional.h>
+#include <tensorpipe/common/socket.h>
 #include <tensorpipe/transport/error.h>
 #include <tensorpipe/transport/shm/connection.h>
 #include <tensorpipe/transport/shm/loop.h>
-#include <tensorpipe/transport/shm/socket.h>
 
 namespace tensorpipe {
 namespace transport {

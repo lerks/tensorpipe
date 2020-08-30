@@ -16,8 +16,6 @@
 #include <tensorpipe/common/error.h>
 
 namespace tensorpipe {
-namespace transport {
-namespace shm {
 
 class Fd {
  public:
@@ -47,13 +45,6 @@ class Fd {
   // Return underlying file descriptor.
   inline int fd() const {
     return fd_;
-  }
-
-  // Release underlying file descriptor.
-  int release() {
-    auto fd = fd_;
-    fd_ = -1;
-    return fd;
   }
 
   // Proxy to read(2) with EINTR retry.
@@ -108,6 +99,4 @@ class Fd {
   int fd_{-1};
 };
 
-} // namespace shm
-} // namespace transport
 } // namespace tensorpipe

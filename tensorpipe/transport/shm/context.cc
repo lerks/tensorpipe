@@ -8,12 +8,12 @@
 
 #include <tensorpipe/transport/shm/context.h>
 
+#include <tensorpipe/common/socket.h>
 #include <tensorpipe/common/system.h>
 #include <tensorpipe/transport/registry.h>
 #include <tensorpipe/transport/shm/connection.h>
 #include <tensorpipe/transport/shm/listener.h>
 #include <tensorpipe/transport/shm/loop.h>
-#include <tensorpipe/transport/shm/socket.h>
 
 namespace tensorpipe {
 namespace transport {

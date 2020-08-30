@@ -17,13 +17,10 @@
 #include <tensorpipe/common/defs.h>
 #include <tensorpipe/common/error.h>
 #include <tensorpipe/common/error_macros.h>
+#include <tensorpipe/common/fd.h>
 #include <tensorpipe/common/optional.h>
-#include <tensorpipe/transport/error.h>
-#include <tensorpipe/transport/shm/fd.h>
 
 namespace tensorpipe {
-namespace transport {
-namespace shm {
 
 namespace {
 
@@ -258,6 +255,4 @@ class Socket final : public Fd {
   }
 };
 
-} // namespace shm
-} // namespace transport
 } // namespace tensorpipe
