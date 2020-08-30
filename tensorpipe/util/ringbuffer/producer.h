@@ -19,13 +19,19 @@ namespace ringbuffer {
 ///
 /// Provides method to write into ringbuffer.
 ///
-class Producer : public RingBufferWrapper {
+class Producer {
  public:
-  // Use base class constructor.
-  using RingBufferWrapper::RingBufferWrapper;
+  Producer() = delete;
+
+  Producer(RingBuffer& rb) : header_{rb.getHeader()}, data_{rb.getData()} {
+    TP_THROW_IF_NULLPTR(data_);
+  }
 
   Producer(const Producer&) = delete;
   Producer(Producer&&) = delete;
+
+  Producer& operator=(const Producer&) = delete;
+  Producer& operator=(Producer&&) = delete;
 
   //
   // Transaction based API.
@@ -163,6 +169,9 @@ class Producer : public RingBufferWrapper {
   }
 
  protected:
+  RingBufferHeader& header_;
+  uint8_t* const data_;
+  unsigned tx_size_ = 0;
   bool inTx_{false};
 
   // Return 0 if succeded, otherwise return negative error code.

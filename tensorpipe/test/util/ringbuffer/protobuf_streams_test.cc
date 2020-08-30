@@ -22,13 +22,20 @@ using namespace tensorpipe::util::ringbuffer;
 
 namespace {
 
-std::shared_ptr<RingBuffer> makeRingBuffer(size_t size) {
-  auto header = std::make_shared<RingBufferHeader>(size);
-  // In C++20 use std::make_shared<uint8_t[]>(size)
-  auto data = std::shared_ptr<uint8_t>(
-      new uint8_t[header->kDataPoolByteSize], std::default_delete<uint8_t[]>());
-  return std::make_shared<RingBuffer>(std::move(header), std::move(data));
-}
+// Holds and owns the memory for the ringbuffer's header and data.
+class RingBufferStorage {
+ public:
+  RingBufferStorage(size_t size) : header_(size) {}
+
+  RingBuffer getRb() {
+    return {&header_, data_.get()};
+  }
+
+ private:
+  RingBufferHeader header_;
+  std::unique_ptr<uint8_t[]> data_ =
+      std::make_unique<uint8_t[]>(header_.kDataPoolByteSize);
+};
 
 proto::Brochure getMessage() {
   proto::Brochure message;
@@ -52,11 +59,9 @@ proto::Brochure getMessage() {
   return message;
 }
 
-void test_serialize_parse(
-    std::shared_ptr<RingBuffer> rb,
-    const proto::Brochure message) {
+void test_serialize_parse(RingBuffer rb, const proto::Brochure message) {
   uint32_t len = message.ByteSize();
-  EXPECT_LE(len, rb->getHeader().kDataPoolByteSize)
+  EXPECT_LE(len, rb.getHeader().kDataPoolByteSize)
       << "Message larger than ring buffer.";
   {
     Producer p{rb};
@@ -70,7 +75,7 @@ void test_serialize_parse(
     ret = p.commitTx();
     EXPECT_EQ(ret, 0);
 
-    EXPECT_EQ(rb->getHeader().usedSizeWeak(), len);
+    EXPECT_EQ(rb.getHeader().usedSizeWeak(), len);
   }
 
   proto::Brochure parsed_message;
@@ -86,7 +91,7 @@ void test_serialize_parse(
     ret = c.commitTx();
     EXPECT_EQ(ret, 0);
 
-    EXPECT_EQ(rb->getHeader().usedSizeWeak(), 0);
+    EXPECT_EQ(rb.getHeader().usedSizeWeak(), 0);
   }
 
   ASSERT_TRUE(google::protobuf::util::MessageDifferencer::Equals(
@@ -97,7 +102,8 @@ void test_serialize_parse(
 
 TEST(RingBuffer, NonWrappingZeroCopyStream) {
   constexpr size_t kBufferSize = 2 * 1024 * 1024;
-  auto rb = makeRingBuffer(kBufferSize);
+  RingBufferStorage storage(kBufferSize);
+  RingBuffer rb = storage.getRb();
 
   proto::Brochure message = getMessage();
 
@@ -106,7 +112,8 @@ TEST(RingBuffer, NonWrappingZeroCopyStream) {
 
 TEST(RingBuffer, WrappingZeroCopyStream) {
   constexpr size_t kBufferSize = 2 * 1024 * 1024;
-  auto rb = makeRingBuffer(kBufferSize);
+  RingBufferStorage storage(kBufferSize);
+  RingBuffer rb = storage.getRb();
 
   // Write and consume enough bytes to force the next write to wrap around.
   {

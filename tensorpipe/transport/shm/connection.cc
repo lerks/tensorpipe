@@ -217,6 +217,10 @@ bool WriteOperation::handleWrite(util::ringbuffer::Producer& outbox) {
   // Start write transaction.
   // Retry because this must succeed.
   // TODO: fallback if it doesn't.
+  // FIXME: In fact this must succeed *on the first try*, because this
+  // connection is the only one writing to that outbox and it always does so
+  // from the reactor thread, hence anyone else holding the lock is a big
+  // error and we should make a big fuss.
   for (;;) {
     const auto ret = outbox.startTx();
     TP_DCHECK(ret >= 0 || ret == -EAGAIN);
@@ -369,13 +373,15 @@ class Connection::Impl : public std::enable_shared_from_this<Connection::Impl>,
   ClosingReceiver closingReceiver_;
 
   // Inbox.
-  int inboxHeaderFd_;
-  int inboxDataFd_;
-  optional<util::ringbuffer::Consumer> inbox_;
+  util::shm::Segment inboxHeaderSegment_;
+  util::shm::Segment inboxDataSegment_;
+  util::ringbuffer::RingBuffer inboxRb_;
   optional<Reactor::TToken> inboxReactorToken_;
 
   // Outbox.
-  optional<util::ringbuffer::Producer> outbox_;
+  util::shm::Segment outboxHeaderSegment_;
+  util::shm::Segment outboxDataSegment_;
+  util::ringbuffer::RingBuffer outboxRb_;
   optional<Reactor::TToken> outboxReactorToken_;
 
   // Peer trigger/tokens.
@@ -522,10 +528,8 @@ void Connection::Impl::initFromLoop() {
   }
 
   // Create ringbuffer for inbox.
-  std::shared_ptr<util::ringbuffer::RingBuffer> inboxRingBuffer;
-  std::tie(inboxHeaderFd_, inboxDataFd_, inboxRingBuffer) =
+  std::tie(inboxHeaderSegment_, inboxDataSegment_, inboxRb_) =
       util::ringbuffer::shm::create(kBufferSize);
-  inbox_.emplace(std::move(inboxRingBuffer));
 
   // Register method to be called when our peer writes to our inbox.
   inboxReactorToken_ = context_->addReaction(runIfAlive(*this, [](Impl& impl) {
@@ -906,8 +910,9 @@ void Connection::Impl::handleEventInFromLoop() {
     }
 
     // Load ringbuffer for outbox.
-    outbox_.emplace(util::ringbuffer::shm::load(
-        outboxHeaderFd.release(), outboxDataFd.release()));
+    std::tie(outboxHeaderSegment_, outboxDataSegment_, outboxRb_) =
+        util::ringbuffer::shm::load(
+            outboxHeaderFd.release(), outboxDataFd.release());
 
     // Initialize remote reactor trigger.
     peerReactorTrigger_.emplace(
@@ -950,8 +955,8 @@ void Connection::Impl::handleEventOutFromLoop() {
         outboxReactorToken_.value(),
         reactorHeaderFd,
         reactorDataFd,
-        inboxHeaderFd_,
-        inboxDataFd_);
+        inboxHeaderSegment_.getFd(),
+        inboxDataSegment_.getFd());
     if (err) {
       setError_(std::move(err));
       return;
@@ -975,10 +980,11 @@ void Connection::Impl::processReadOperationsFromLoop() {
     return;
   }
   // Serve read operations
+  util::ringbuffer::Consumer inboxConsumer(inboxRb_);
   while (!readOperations_.empty()) {
     auto readOperation = std::move(readOperations_.front());
     readOperations_.pop_front();
-    if (readOperation.handleRead(*inbox_)) {
+    if (readOperation.handleRead(inboxConsumer)) {
       peerReactorTrigger_->run(peerOutboxReactorToken_.value());
     }
     if (!readOperation.completed()) {
@@ -995,10 +1001,11 @@ void Connection::Impl::processWriteOperationsFromLoop() {
     return;
   }
 
+  util::ringbuffer::Producer outboxProducer(outboxRb_);
   while (!writeOperations_.empty()) {
     auto writeOperation = std::move(writeOperations_.front());
     writeOperations_.pop_front();
-    if (writeOperation.handleWrite(*outbox_)) {
+    if (writeOperation.handleWrite(outboxProducer)) {
       peerReactorTrigger_->run(peerInboxReactorToken_.value());
     }
     if (!writeOperation.completed()) {
